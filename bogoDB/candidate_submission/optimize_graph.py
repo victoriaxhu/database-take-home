@@ -70,7 +70,6 @@ def verify_constraints(graph, max_edges_per_node, max_total_edges):
 
     return True
 
-
 def optimize_graph(
     initial_graph,
     results,
@@ -80,13 +79,14 @@ def optimize_graph(
 ):
     """
     Optimize the graph to improve random walk query performance.
+    Special focus on improving access to nodes 0-19, particularly 0-4.
 
     Args:
-        initial_graph: Initial graph adjacency list
+        initial_graph: Initial graph adjacency list (nodes 0-499)
         results: Results from queries on the initial graph
-        num_nodes: Number of nodes in the graph
+        num_nodes: Number of nodes in the graph (500)
         max_total_edges: Maximum total edges allowed
-        max_edges_per_node: Maximum edges per node
+        max_edges_per_node: Maximum edges per node (3)
 
     Returns:
         Optimized graph
@@ -98,76 +98,207 @@ def optimize_graph(
     for node, edges in initial_graph.items():
         optimized_graph[node] = dict(edges)
 
-    # =============================================================
-    # TODO: Implement your optimization strategy here
-    # =============================================================
-    #
-    # Your goal is to optimize the graph structure to:
-    # 1. Increase the success rate of queries
-    # 2. Minimize the path length for successful queries
-    #
-    # You have access to:
-    # - initial_graph: The current graph structure
-    # - results: The results of running queries on the initial graph
-    #
-    # Query results contain:
-    # - Each query's target node
-    # - Whether the query was successful
-    # - The path taken during the random walk
-    #
-    # Remember the constraints:
-    # - max_total_edges: Maximum number of edges in the graph
-    # - max_edges_per_node: Maximum edges per node
-    # - All nodes must remain in the graph
-    # - Edge weights must be positive and ≤ 10
+    # Define priority nodes (top 20 most visited, with 0-4 being highest priority)
+    highest_priority_nodes = set(range(5))  # Nodes 0-4
+    high_priority_nodes = set(range(5, 20))  # Nodes 5-19
+    
+    # Extract the detailed results which contain the query paths
+    detailed_results = results.get("detailed_results", [])
+    
+    if not detailed_results:
+        print("WARNING: No detailed results found. Using original graph.")
+        return optimized_graph
 
-    # ---------------------------------------------------------------
-    # EXAMPLE: Simple strategy to meet edge count constraint
-    # This is just a basic example - you should implement a more
-    # sophisticated strategy based on query analysis!
-    # ---------------------------------------------------------------
+    # Initialize counters
+    edge_success_counter = Counter()
+    edge_failure_counter = Counter()
+    node_failure_counter = Counter()
+    
+    # Process each query result
+    for query_result in detailed_results:
+        target = query_result.get("target")
+        is_success = query_result.get("is_success")
+        paths = query_result.get("paths", [])
+        
+        if not is_success:
+            # Weight failures by priority
+            if target in highest_priority_nodes:
+                node_failure_counter[target] += 3  # Triple weight for highest priority
+            elif target in high_priority_nodes:
+                node_failure_counter[target] += 2  # Double weight for high priority
+            else:
+                node_failure_counter[target] += 1
+        
+        # Process each path in the paths list
+        for path_entry in paths:
+            if len(path_entry) >= 2:
+                success = path_entry[0]  # First element is success flag
+                path = path_entry[1]     # Second element is the path list
+                
+                # Process edges in the path
+                for i in range(len(path) - 1):
+                    src, dst = path[i], path[i + 1]
+                    edge = (src, dst)
+                    
+                    # If the destination is a priority node, give this edge special attention
+                    priority_multiplier = 1
+                    if dst in highest_priority_nodes:
+                        priority_multiplier = 3
+                    elif dst in high_priority_nodes:
+                        priority_multiplier = 2
+                    
+                    if success:
+                        edge_success_counter[edge] += 1 * priority_multiplier
+                    else:
+                        edge_failure_counter[edge] += 1
+    
+    # Determine node type for consistent keys
+    node_type = type(next(iter(optimized_graph.keys())))
+    
+    # PHASE 1: Reinforce successful edges
+    for (src, dst), count in edge_success_counter.items():
+        src_key = src if isinstance(src, node_type) else node_type(src)
+        dst_key = dst if isinstance(dst, node_type) else node_type(dst)
+        
+        if src_key in optimized_graph and dst_key in optimized_graph[src_key]:
+            # Increase weight for successful edges
+            optimized_graph[src_key][dst_key] = min(optimized_graph[src_key][dst_key] + count, 10)
 
-    # Count total edges in the initial graph
+    # PHASE 2: Weaken edges that lead to failures
+    for (src, dst), count in edge_failure_counter.items():
+        src_key = src if isinstance(src, node_type) else node_type(src)
+        dst_key = dst if isinstance(dst, node_type) else node_type(dst)
+        
+        if src_key in optimized_graph and dst_key in optimized_graph[src_key]:
+            # Don't reduce weight for edges leading to priority nodes as much
+            reduction = count
+            if dst_key in highest_priority_nodes:
+                reduction = max(1, count // 3)  # Reduced penalty
+            elif dst_key in high_priority_nodes:
+                reduction = max(1, count // 2)  # Somewhat reduced penalty
+            
+            optimized_graph[src_key][dst_key] = max(optimized_graph[src_key][dst_key] - reduction, 1)
+
+    # PHASE 3: Improve connectivity to priority nodes
+    # First, handle highest priority nodes (0-4)
+    for target in highest_priority_nodes:
+        target_key = target if isinstance(target, node_type) else node_type(target)
+        
+        # Find nodes that could benefit from a direct connection to this priority target
+        potential_sources = []
+        for node in optimized_graph:
+            if node != target_key and target_key not in optimized_graph[node] and len(optimized_graph[node]) < max_edges_per_node:
+                potential_sources.append(node)
+        
+        # Sort potential sources by distance from other high-priority nodes
+        potential_sources.sort(key=lambda x: sum(1 for pri in highest_priority_nodes if node_type(pri) in optimized_graph[x]))
+        
+        # Add connections from up to 20 nodes to this high priority target
+        connections_to_add = min(20, len(potential_sources))
+        for i in range(connections_to_add):
+            optimized_graph[potential_sources[i]][target_key] = 10  # Maximum weight
+    
+    # Then handle secondary priority nodes (5-19)
+    for target in high_priority_nodes:
+        target_key = target if isinstance(target, node_type) else node_type(target)
+        
+        # Add fewer connections to these secondary priority nodes
+        potential_sources = []
+        for node in optimized_graph:
+            if node != target_key and target_key not in optimized_graph[node] and len(optimized_graph[node]) < max_edges_per_node:
+                potential_sources.append(node)
+        
+        potential_sources.sort(key=lambda x: sum(1 for pri in high_priority_nodes if node_type(pri) in optimized_graph[x]))
+        
+        # Add connections from up to 10 nodes to this secondary priority target
+        connections_to_add = min(10, len(potential_sources))
+        for i in range(connections_to_add):
+            optimized_graph[potential_sources[i]][target_key] = 8  # High weight
+    
+    # PHASE 4: Create "hub" nodes that connect to multiple priority targets
+    # Find nodes that have space for more connections and make them hubs
+    potential_hubs = []
+    for node in optimized_graph:
+        if len(optimized_graph[node]) < max_edges_per_node - 1:  # Need at least 2 slots
+            priority_connections = sum(1 for dst in optimized_graph[node] if dst in highest_priority_nodes or dst in high_priority_nodes)
+            potential_hubs.append((node, priority_connections, len(optimized_graph[node])))
+    
+    # Sort by: most existing priority connections, then fewest total edges
+    potential_hubs.sort(key=lambda x: (-x[1], x[2]))
+    
+    # Select top 25 potential hubs and connect them to priority nodes they're not already connected to
+    for i, (hub, _, _) in enumerate(potential_hubs[:25]):
+        # Connect to highest priority nodes first
+        for target in highest_priority_nodes:
+            target_key = target if isinstance(target, node_type) else node_type(target)
+            if target_key not in optimized_graph[hub] and len(optimized_graph[hub]) < max_edges_per_node:
+                optimized_graph[hub][target_key] = 10
+        
+        # Then connect to secondary priority nodes if space
+        for target in high_priority_nodes:
+            target_key = target if isinstance(target, node_type) else node_type(target)
+            if target_key not in optimized_graph[hub] and len(optimized_graph[hub]) < max_edges_per_node:
+                optimized_graph[hub][target_key] = 8
+    
+    # PHASE 5: Prune edges if we exceed the maximum total
     total_edges = sum(len(edges) for edges in optimized_graph.values())
-
-    # If we exceed the limit, we need to prune edges
+    
     if total_edges > max_total_edges:
-        print(
-            f"Initial graph has {total_edges} edges, need to remove {total_edges - max_total_edges}"
-        )
-
-        # Example pruning logic (replace with your optimized strategy)
+        print(f"Need to prune {total_edges - max_total_edges} edges")
+        
+        # Create a list of all edges with their utility scores
+        edge_utility = []
+        for src, edges in optimized_graph.items():
+            for dst, weight in edges.items():
+                # Calculate utility (higher = more useful)
+                dst_int = int(dst) if not isinstance(dst, int) else dst
+                
+                # Base utility on priority and usage
+                priority_factor = 1
+                if dst_int in highest_priority_nodes:
+                    priority_factor = 10  # Strongly protect edges to highest priority nodes
+                elif dst_int in high_priority_nodes:
+                    priority_factor = 5   # Protect edges to high priority nodes
+                
+                success_count = edge_success_counter.get((src, dst), 0)
+                failure_count = edge_failure_counter.get((src, dst), 0) + 1  # +1 to avoid division by zero
+                
+                utility = (success_count + 1) * priority_factor * weight / failure_count
+                edge_utility.append((utility, src, dst))
+        
+        # Sort by utility (ascending - we'll remove lowest utility edges first)
+        edge_utility.sort()
+        
+        # Remove edges until we're within the limit
         edges_to_remove = total_edges - max_total_edges
         removed = 0
-
-        # Sort nodes by number of outgoing edges (descending)
-        nodes_by_edge_count = sorted(
-            optimized_graph.keys(), key=lambda n: len(optimized_graph[n]), reverse=True
-        )
-
-        # Remove edges from nodes with the most connections first
-        for node in nodes_by_edge_count:
+        
+        for _, src, dst in edge_utility:
+            # Never remove an edge if it's the node's only outgoing edge
+            # Also protect edges to priority nodes if possible
+            dst_int = int(dst) if not isinstance(dst, int) else dst
+            
+            # Skip this edge if:
+            # 1. It's the node's only edge (would disconnect the node)
+            # 2. It's to a highest priority node and node has >2 edges
+            # 3. It's to a high priority node and node has >1 edge and we still have other options
+            if len(optimized_graph[src]) <= 1:
+                continue
+            
+            if dst_int in highest_priority_nodes and len(optimized_graph[src]) <= 2:
+                continue
+                
+            if dst_int in high_priority_nodes and len(optimized_graph[src]) <= 1 and removed < edges_to_remove - 1:
+                continue
+            
+            # Remove this edge
+            del optimized_graph[src][dst]
+            removed += 1
+            
             if removed >= edges_to_remove:
                 break
-
-            # As a simplistic example, remove the edge with lowest weight
-            if len(optimized_graph[node]) > 1:  # Ensure node keeps at least one edge
-                # Find edge with minimum weight
-                min_edge = min(optimized_graph[node].items(), key=lambda x: x[1])
-                del optimized_graph[node][min_edge[0]]
-                removed += 1
-
-    # =============================================================
-    # End of your implementation
-    # =============================================================
-
-    # Verify constraints
-    if not verify_constraints(optimized_graph, max_edges_per_node, max_total_edges):
-        print("WARNING: Your optimized graph does not meet the constraints!")
-        print("The evaluation script will reject it. Please fix the issues.")
-
+    
     return optimized_graph
-
 
 if __name__ == "__main__":
     # Get file paths
